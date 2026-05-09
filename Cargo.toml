@@ -1,0 +1,9 @@
+[package]
+name = "maisimai"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust Simai (maimai) chart parser and exporter, ported from MaiConverter."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
