@@ -96,16 +96,24 @@ fn export_chart_with(chart: &SimaiChart, max_den: u32) -> String {
 
         let bpm_at_next = bpm_value_at(chart, cur + 1.0);
         let frag = render_fragment(&notes_here, &bpm_here, bpm_at_next, max_den);
+        // BPM marker must appear before the divisor, e.g. (210){8} not {8}(210).
+        let bpm_prefix = if let Some(b) = bpm_here.first() {
+            format!("({})", trim_float(b.bpm))
+        } else {
+            String::new()
+        };
 
         if prev_div != Some(cur_div) || (measure_tick.floor() as i64) > prev_measure_int {
             if !out.is_empty() {
                 out.push('\n');
             }
+            out.push_str(&bpm_prefix);
             out.push_str(&format!("{{{cur_div}}}"));
             out.push_str(&frag);
             prev_div = Some(cur_div);
             prev_measure_int = measure_tick.floor() as i64;
         } else {
+            out.push_str(&bpm_prefix);
             out.push_str(&frag);
         }
         measure_tick = cur;
@@ -134,12 +142,11 @@ fn export_chart_with(chart: &SimaiChart, max_den: u32) -> String {
 /// Render every event at a single measure into a Simai fragment. Order
 /// matches MaiConverter: bpm → divisor (handled outside) → taps → holds →
 /// touch taps → touch holds → slides.
-fn render_fragment(notes: &[&SimaiNote], bpms: &[&Bpm], bpm_for_slides: f32, max_den: u32) -> String {
+fn render_fragment(notes: &[&SimaiNote], _bpms: &[&Bpm], bpm_for_slides: f32, max_den: u32) -> String {
     let mut out = String::new();
     let mut counter = 0u32;
-    if let Some(b) = bpms.first() {
-        out.push_str(&format!("({})", trim_float(b.bpm)));
-    }
+    // BPM is now emitted by the caller before the {div} marker,
+    // so we skip it here to avoid duplication.
 
     // Star buttons that already produced a tap; used when emitting a slide
     // to know if we still need to write a star marker.
@@ -229,7 +236,7 @@ fn render_fragment(notes: &[&SimaiNote], bpms: &[&Bpm], bpm_for_slides: f32, max
 
     let mut written_starts: Vec<u8> = Vec::new();
     for n in &slides {
-        if let SimaiNote::Slide { start, end, pattern, reflect, duration, delay, is_break, is_ex, is_tapless, .. } = n {
+        if let SimaiNote::Slide { start, end, pattern, reflect, duration, delay, is_break, is_ex, is_tapless, chain, .. } = n {
             if counter > 0 && !written_starts.contains(start) { out.push('/'); }
             // Star/break/ex/tapless modifier when emitting head for the first time.
             let head = if written_starts.contains(start) {
@@ -251,6 +258,15 @@ fn render_fragment(notes: &[&SimaiNote], bpms: &[&Bpm], bpm_for_slides: f32, max
                 SlidePattern::BigV => format!("V{}", reflect.unwrap_or(*end) + 1),
                 _ => pattern.as_str().to_string(),
             };
+            // `end` is the first arc's end button (parser stores it correctly).
+            // Emit chain arcs inline (e.g. `4<6-2[dur]`).
+            let chain_str: String = chain.iter().map(|(cp, ce, cr)| {
+                let cp_str = match cp {
+                    SlidePattern::BigV => format!("V{}", cr.unwrap_or(*ce) + 1),
+                    _ => cp.as_str().to_string(),
+                };
+                format!("{cp_str}{}", ce + 1)
+            }).collect();
             // Duration: when delay differs from default 0.25 measures we
             // emit `[bpm#D:N]` form using the equivalent bpm trick.
             let suffix = if (delay - 0.25).abs() > 0.0025 {
@@ -262,7 +278,7 @@ fn render_fragment(notes: &[&SimaiNote], bpms: &[&Bpm], bpm_for_slides: f32, max
                 let (den, num) = float_to_fraction(*duration, max_den * 10);
                 format!("[{den}:{num}]")
             };
-            out.push_str(&format!("{head}{mods}{pat_str}{}{suffix}", end + 1));
+            out.push_str(&format!("{head}{mods}{pat_str}{}{chain_str}{suffix}", end + 1));
             counter += 1;
             if !written_starts.contains(start) {
                 written_starts.push(*start);

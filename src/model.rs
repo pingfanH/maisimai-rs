@@ -14,9 +14,9 @@ pub enum SlidePattern {
     Line,
     /// `^` Short arc (shortest direction).
     Caret,
-    /// `<` Long arc going counter-clockwise from a top button (clockwise from bottom).
+    /// `<` Clockwise arc.
     Left,
-    /// `>` Long arc going clockwise from a top button (counter-clockwise from bottom).
+    /// `>` Counter-clockwise arc.
     Right,
     /// `v` V-shape passing through the center.
     LowerV,
@@ -93,6 +93,9 @@ pub enum SimaiNote {
         is_ex: bool,
         /// Slide had no companion star (modifier `?`/`!`/`$`).
         is_tapless: bool,
+        /// Chained arcs after the first: `(pattern, end_button, reflect)`.
+        /// e.g. `4<6-2` has chain = `[(Line, 1, None)]` (end=1 is 0-indexed for button 2).
+        chain: Vec<(SlidePattern, u8, Option<u8>)>,
     },
     TouchTap {
         measure: f32,

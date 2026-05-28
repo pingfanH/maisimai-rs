@@ -288,7 +288,7 @@ fn parse_button_note(
 
     // Slide pattern char comes AFTER modifiers.
     let next = if *i < bytes.len() { bytes[*i] as char } else { '\0' };
-    let is_slide_start = matches!(next, '-' | '^' | '<' | '>' | 's' | 'z' | 'v' | 'w' | 'p' | 'q' | 'V');
+    let is_slide_start = is_slide_pattern_char(next);
 
     if is_hold {
         let mut duration = 0.0;
@@ -314,41 +314,73 @@ fn parse_button_note(
             star_buttons.push(button);
         }
 
-        // Read this slide arc and any chained `*` arcs that follow.
+        // Read first arc.
         let (first_arc, end_idx) = read_slide_arc(bytes, *i)?;
         *i = end_idx;
-        // Parse trailing duration which applies to ALL chained arcs unless
-        // an arc has its own.
+
+        // Collect chained arcs (via `*` or implicit concatenation like `4<6-2`).
+        let mut chain: Vec<(SlidePattern, u8, Option<u8>)> = Vec::new();
+        loop {
+            if *i >= bytes.len() { break; }
+            // Peek: is the next token a `[dur]` followed by a chain continuation?
+            // If it's `[dur]` followed by `*` or a slide-pattern char, consume it
+            // as an intermediate per-arc duration and continue the chain.
+            // If it's `[dur]` followed by something else, it's the trailing
+            // duration — leave it for the outer handler.
+            if bytes[*i] == b'[' {
+                let saved_i = *i;
+                let _ = parse_duration(bytes, i)?;
+                // After consuming [dur], check if a chain follows.
+                let has_chain = *i < bytes.len()
+                    && (bytes[*i] == b'*' || is_slide_pattern_char(bytes[*i] as char));
+                if !has_chain {
+                    // Restore position — this [dur] is the trailing duration.
+                    *i = saved_i;
+                    break;
+                }
+                // Otherwise fall through to consume the chain arc below.
+            }
+            if *i >= bytes.len() { break; }
+            if bytes[*i] == b'*' {
+                *i += 1;
+                let _ = read_modifiers(bytes, i);
+            } else if is_slide_pattern_char(bytes[*i] as char) {
+                // Implicit chain — pattern char follows directly.
+            } else {
+                break;
+            }
+            let (arc, end_idx) = read_slide_arc(bytes, *i)?;
+            *i = end_idx;
+            chain.push((arc.pattern, arc.end, arc.reflect));
+        }
+
+        // Trailing `[dur]` applies to the whole slide.
         let mut shared_dur: Option<(Option<f32>, f32)> = None;
         if *i < bytes.len() && bytes[*i] == b'[' {
             shared_dur = Some(parse_duration(bytes, i)?);
         }
         let (eq_bpm, base_dur) = shared_dur.unwrap_or((None, 0.0));
-        let base_dur = if shared_dur.is_some() { base_dur } else { 0.0 };
 
-        // Compute slide delay. Default delay is 0.25 measures; equivalent_bpm
-        // adjusts both delay and duration multiplicatively (mirrors
-        // MaiConverter's `multiplier = current_bpm / equivalent_bpm`).
         let cur_bpm = current_bpm_at(chart, measure);
         let (delay, dur) = scale_with_eq_bpm(eq_bpm, base_dur, cur_bpm);
-        push_slide(chart, measure, button, &first_arc, delay, dur, is_break, is_ex, is_tapless || is_dollar_star);
 
-        // Chained slides start with `*`.
-        while *i < bytes.len() && bytes[*i] == b'*' {
-            *i += 1;
-            // Skip any modifier characters before the chained slide pattern.
-            let _ = read_modifiers(bytes, i);
-            let (arc, end_idx) = read_slide_arc(bytes, *i)?;
-            *i = end_idx;
-            // Optional per-arc duration.
-            let (eq_bpm2, dur2) = if *i < bytes.len() && bytes[*i] == b'[' {
-                parse_duration(bytes, i)?
-            } else {
-                (eq_bpm, base_dur)
-            };
-            let (delay2, dur2) = scale_with_eq_bpm(eq_bpm2, dur2, cur_bpm);
-            push_slide(chart, measure, button, &arc, delay2, dur2, is_break, is_ex, true);
-        }
+        chart.notes.push(SimaiNote::Slide {
+            measure,
+            start: button,
+            end: first_arc.end,
+            pattern: first_arc.pattern,
+            reflect: first_arc.reflect,
+            duration: dur,
+            delay,
+            is_break,
+            is_ex,
+            is_tapless: is_tapless || is_dollar_star,
+            chain,
+        });
+
+        // Chained slides starting with `*` at top level (separate star head
+        // sharing the same start button) are still handled by the outer loop
+        // re-entering parse_button_note.
         return Ok(());
     }
 
@@ -385,6 +417,11 @@ fn current_bpm_at(chart: &SimaiChart, measure: f32) -> f32 {
         last = b.bpm;
     }
     if last <= 0.0 { 120.0 } else { last }
+}
+
+/// Returns true if `c` is a valid slide pattern start character.
+fn is_slide_pattern_char(c: char) -> bool {
+    matches!(c, '-' | '^' | '<' | '>' | 's' | 'z' | 'v' | 'w' | 'p' | 'q' | 'V')
 }
 
 #[derive(Debug, Clone)]
@@ -448,30 +485,6 @@ fn read_slide_arc(bytes: &[u8], mut i: usize) -> Result<(SlideArc, usize), Parse
     Ok((SlideArc { pattern, end, reflect }, i))
 }
 
-fn push_slide(
-    chart: &mut SimaiChart,
-    measure: f32,
-    start: u8,
-    arc: &SlideArc,
-    delay: f32,
-    duration: f32,
-    is_break: bool,
-    is_ex: bool,
-    is_tapless: bool,
-) {
-    chart.notes.push(SimaiNote::Slide {
-        measure,
-        start,
-        end: arc.end,
-        pattern: arc.pattern,
-        reflect: arc.reflect,
-        duration,
-        delay,
-        is_break,
-        is_ex,
-        is_tapless,
-    });
-}
 
 fn parse_touch_note(
     bytes: &[u8],
