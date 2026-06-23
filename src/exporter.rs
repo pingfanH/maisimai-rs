@@ -255,16 +255,31 @@ fn render_fragment(notes: &[&SimaiNote], _bpms: &[&Bpm], bpm_for_slides: f32, ma
                 }
             }
             let pat_str = match pattern {
-                SlidePattern::BigV => format!("V{}", reflect.unwrap_or(*end) + 1),
+                SlidePattern::BigV => {
+                    if let Some(r) = reflect {
+                        format!("V{}", r + 1)
+                    } else {
+                        "V".to_string()
+                    }
+                },
                 _ => pattern.as_str().to_string(),
             };
+            // Track previous end for chain V patterns
+            let mut prev_chain_end = *end;
             // `end` is the first arc's end button (parser stores it correctly).
             // Emit chain arcs inline (e.g. `4<6-2[dur]`).
-            let chain_str: String = chain.iter().map(|(cp, ce, cr)| {
+            let chain_str: String = chain.iter().map(|(cp, ce, cr, _is_star)| {
                 let cp_str = match cp {
-                    SlidePattern::BigV => format!("V{}", cr.unwrap_or(*ce) + 1),
+                    SlidePattern::BigV => {
+                        if let Some(r) = cr {
+                            format!("V{}", r + 1)
+                        } else {
+                            "V".to_string()
+                        }
+                    },
                     _ => cp.as_str().to_string(),
                 };
+                prev_chain_end = *ce; // Update for next chain segment
                 format!("{cp_str}{}", ce + 1)
             }).collect();
             // Duration: when delay differs from default 0.25 measures we

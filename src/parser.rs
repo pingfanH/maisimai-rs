@@ -110,6 +110,7 @@ fn parse_fragment(
     // Track buttons that already produced a star tap so we don't add a
     // duplicate when a chained slide reuses the same start.
     let mut star_buttons: Vec<u8> = Vec::new();
+    let mut last_button: Option<u8> = None;
 
     while i < bytes.len() {
         let c = bytes[i] as char;
@@ -118,6 +119,74 @@ fn parse_fragment(
                 i += 1;
                 pseudo_offset = 0.0;
                 pending_pseudo = false;
+            }
+            '`' => {
+                pending_pseudo = true;
+                i += 1;
+            }
+            '(' => {
+                let end = find_close(bytes, i, b')')?;
+                let inner = std::str::from_utf8(&bytes[i + 1..end]).unwrap_or("");
+                let bpm: f32 = inner
+                    .parse()
+                    .map_err(|_| ParseError { message: format!("invalid bpm: {inner}"), offset: Some(i) })?;
+                if bpm <= 0.0 {
+                    return err(format!("non-positive bpm: {bpm}"));
+                }
+                chart.bpms.retain(|b| (b.measure - base_measure).abs() > 0.0001);
+                chart.bpms.push(Bpm { measure: base_measure, bpm });
+                i = end + 1;
+            }
+            '{' => {
+                let end = find_close(bytes, i, b'}')?;
+                let inner = std::str::from_utf8(&bytes[i + 1..end]).unwrap_or("");
+                let main = inner.split('#').next().unwrap_or(inner);
+                let v: f32 = main.parse().map_err(|_| ParseError {
+                    message: format!("invalid divisor: {inner}"),
+                    offset: Some(i),
+                })?;
+                if v <= 0.0 {
+                    return err(format!("non-positive divisor: {v}"));
+                }
+                *divisor = v;
+                i = end + 1;
+            }
+            '0'..='8' => {
+                let m_offset = if pending_pseudo {
+                    pseudo_offset += 0.0027;
+                    pseudo_offset
+                } else {
+                    pseudo_offset = 0.0;
+                    0.0
+                };
+                pending_pseudo = false;
+                if bytes[i] != b'0' {
+                    let digit = bytes[i] as u8 - b'1';
+                    last_button = Some(digit & 0x07);
+                }
+                parse_button_note(bytes, &mut i, base_measure + m_offset, chart, &mut star_buttons)?;
+            }
+            '*' => {
+                i += 1;
+                let mods = read_modifiers(bytes, &mut i);
+                let is_break = mods.contains('b');
+                let is_ex = mods.contains('x');
+                let is_tapless = mods.contains('?') || mods.contains('!');
+                if let Some(btn) = last_button {
+                    let m_offset = if pending_pseudo {
+                        pseudo_offset += 0.0027;
+                        pseudo_offset
+                    } else {
+                        0.0
+                    };
+                    pending_pseudo = false;
+                    parse_slide_body(bytes, &mut i, btn, base_measure + m_offset, chart, &mut star_buttons, is_break, is_ex, is_tapless)?;
+                } else {
+                    return Err(ParseError {
+                        message: "* without prior button".to_string(),
+                        offset: Some(i),
+                    });
+                }
             }
             '`' => {
                 pending_pseudo = true;
@@ -220,15 +289,35 @@ fn read_modifiers(bytes: &[u8], i: &mut usize) -> String {
 
 /// Parse a `[D:N]` or `[bpm#D:N]` duration block. Returns `(equivalent_bpm,
 /// duration_measures)`. On a malformed block returns an error.
-fn parse_duration(bytes: &[u8], i: &mut usize) -> Result<(Option<f32>, f32), ParseError> {
+fn parse_duration(bytes: &[u8], i: &mut usize) -> Result<(Option<f32>, f32, Option<f32>), ParseError> {
     debug_assert_eq!(bytes[*i], b'[');
     let end = find_close(bytes, *i, b']')?;
     let inner = std::str::from_utf8(&bytes[*i + 1..end]).unwrap_or("");
     *i = end + 1;
 
+    // Handle `##` format: delay##duration
+    if let Some(idx) = inner.find("##") {
+        let delay_str = &inner[..idx];
+        let dur_str = &inner[idx + 2..];
+        let delay: f32 = delay_str.parse().unwrap_or(0.0);
+        let dur: f32 = dur_str.parse().map_err(|_| ParseError {
+            message: format!("invalid ## duration: {dur_str}"),
+            offset: None,
+        })?;
+        return Ok((None, dur, Some(delay)));
+    }
+
     let (eq_bpm, body) = if let Some(idx) = inner.find('#') {
         let head = &inner[..idx];
         let body = &inner[idx + 1..];
+        if head.is_empty() {
+            // Format: `#seconds`
+            let dur: f32 = body.parse().map_err(|_| ParseError {
+                message: format!("invalid duration: {body}"),
+                offset: None,
+            })?;
+            return Ok((None, dur, None));
+        }
         let eq: f32 = head.parse().map_err(|_| ParseError {
             message: format!("invalid equivalent bpm: {head}"),
             offset: None,
@@ -238,8 +327,6 @@ fn parse_duration(bytes: &[u8], i: &mut usize) -> Result<(Option<f32>, f32), Par
         (None, inner)
     };
 
-    // Body is `D:N`. Some rare charts use `##S` (seconds) which we don't
-    // support; report an error for clarity.
     let mut parts = body.split(':');
     let den_str = parts.next().unwrap_or("");
     let num_str = parts.next().ok_or_else(|| ParseError {
@@ -253,9 +340,9 @@ fn parse_duration(bytes: &[u8], i: &mut usize) -> Result<(Option<f32>, f32), Par
         .parse()
         .map_err(|_| ParseError { message: format!("invalid numerator: {num_str}"), offset: None })?;
     if den <= 0.0 {
-        return Ok((eq_bpm, 0.0));
+        return Ok((eq_bpm, 0.0, None));
     }
-    Ok((eq_bpm, num / den))
+    Ok((eq_bpm, num / den, None))
 }
 
 fn parse_button_note(
@@ -280,8 +367,8 @@ fn parse_button_note(
     let button: u8 = (digit as u8 - b'1') & 0x07;
 
     let mods = read_modifiers(bytes, i);
-    let is_break = mods.contains('b');
-    let is_ex = mods.contains('x');
+    let mut is_break = mods.contains('b');
+    let mut is_ex = mods.contains('x');
     let is_hold = mods.contains('h');
     let is_dollar_star = mods.contains('$');
     let is_tapless = mods.contains('?') || mods.contains('!') || mods.contains('$');
@@ -293,7 +380,7 @@ fn parse_button_note(
     if is_hold {
         let mut duration = 0.0;
         if *i < bytes.len() && bytes[*i] == b'[' {
-            let (_eq, d) = parse_duration(bytes, i)?;
+            let (_eq, d, _) = parse_duration(bytes, i)?;
             duration = d;
         }
         chart.notes.push(SimaiNote::Hold { measure, button, duration, is_ex });
@@ -301,86 +388,7 @@ fn parse_button_note(
     }
 
     if is_slide_start {
-        // Optional companion star (added unless the slide is `tapless` or
-        // a star already exists at this button this beat).
-        if !is_tapless && !star_buttons.contains(&button) {
-            chart.notes.push(SimaiNote::Tap {
-                measure,
-                button,
-                is_break,
-                is_ex,
-                is_star: true,
-            });
-            star_buttons.push(button);
-        }
-
-        // Read first arc.
-        let (first_arc, end_idx) = read_slide_arc(bytes, *i)?;
-        *i = end_idx;
-
-        // Collect chained arcs (via `*` or implicit concatenation like `4<6-2`).
-        let mut chain: Vec<(SlidePattern, u8, Option<u8>)> = Vec::new();
-        loop {
-            if *i >= bytes.len() { break; }
-            // Peek: is the next token a `[dur]` followed by a chain continuation?
-            // If it's `[dur]` followed by `*` or a slide-pattern char, consume it
-            // as an intermediate per-arc duration and continue the chain.
-            // If it's `[dur]` followed by something else, it's the trailing
-            // duration — leave it for the outer handler.
-            if bytes[*i] == b'[' {
-                let saved_i = *i;
-                let _ = parse_duration(bytes, i)?;
-                // After consuming [dur], check if a chain follows.
-                let has_chain = *i < bytes.len()
-                    && (bytes[*i] == b'*' || is_slide_pattern_char(bytes[*i] as char));
-                if !has_chain {
-                    // Restore position — this [dur] is the trailing duration.
-                    *i = saved_i;
-                    break;
-                }
-                // Otherwise fall through to consume the chain arc below.
-            }
-            if *i >= bytes.len() { break; }
-            if bytes[*i] == b'*' {
-                *i += 1;
-                let _ = read_modifiers(bytes, i);
-            } else if is_slide_pattern_char(bytes[*i] as char) {
-                // Implicit chain — pattern char follows directly.
-            } else {
-                break;
-            }
-            let (arc, end_idx) = read_slide_arc(bytes, *i)?;
-            *i = end_idx;
-            chain.push((arc.pattern, arc.end, arc.reflect));
-        }
-
-        // Trailing `[dur]` applies to the whole slide.
-        let mut shared_dur: Option<(Option<f32>, f32)> = None;
-        if *i < bytes.len() && bytes[*i] == b'[' {
-            shared_dur = Some(parse_duration(bytes, i)?);
-        }
-        let (eq_bpm, base_dur) = shared_dur.unwrap_or((None, 0.0));
-
-        let cur_bpm = current_bpm_at(chart, measure);
-        let (delay, dur) = scale_with_eq_bpm(eq_bpm, base_dur, cur_bpm);
-
-        chart.notes.push(SimaiNote::Slide {
-            measure,
-            start: button,
-            end: first_arc.end,
-            pattern: first_arc.pattern,
-            reflect: first_arc.reflect,
-            duration: dur,
-            delay,
-            is_break,
-            is_ex,
-            is_tapless: is_tapless || is_dollar_star,
-            chain,
-        });
-
-        // Chained slides starting with `*` at top level (separate star head
-        // sharing the same start button) are still handled by the outer loop
-        // re-entering parse_button_note.
+        parse_slide_body(bytes, i, button, measure, chart, star_buttons, is_break, is_ex, is_tapless)?;
         return Ok(());
     }
 
@@ -392,6 +400,100 @@ fn parse_button_note(
         is_ex,
         is_star: is_dollar_star,
     });
+    Ok(())
+}
+
+fn parse_slide_body(
+    bytes: &[u8],
+    i: &mut usize,
+    button: u8,
+    measure: f32,
+    chart: &mut SimaiChart,
+    star_buttons: &mut Vec<u8>,
+    mut is_break: bool,
+    mut is_ex: bool,
+    is_tapless: bool,
+) -> Result<(), ParseError> {
+    if !is_tapless && !star_buttons.contains(&button) {
+        chart.notes.push(SimaiNote::Tap {
+            measure,
+            button,
+            is_break,
+            is_ex,
+            is_star: true,
+        });
+        star_buttons.push(button);
+    }
+
+    let (first_arc, end_idx) = read_slide_arc(bytes, *i)?;
+    *i = end_idx;
+    let first_mods = read_modifiers(bytes, i);
+    is_break = is_break || first_mods.contains('b');
+    is_ex = is_ex || first_mods.contains('x');
+
+    let mut chain: Vec<(SlidePattern, u8, Option<u8>, bool)> = Vec::new();
+    loop {
+        if *i >= bytes.len() { break; }
+        if bytes[*i] == b'[' {
+            let saved_i = *i;
+            let _ = parse_duration(bytes, i)?;
+            let has_chain = *i < bytes.len()
+                && (bytes[*i] == b'*' || is_slide_pattern_char(bytes[*i] as char));
+            if !has_chain {
+                *i = saved_i;
+                break;
+            }
+        }
+        if *i >= bytes.len() { break; }
+        let is_star = bytes[*i] == b'*';
+        if is_star {
+            *i += 1;
+            let _ = read_modifiers(bytes, i);
+        } else if is_slide_pattern_char(bytes[*i] as char) {
+        } else {
+            break;
+        }
+        let (arc, end_idx) = read_slide_arc(bytes, *i)?;
+        *i = end_idx;
+        let arc_mods = read_modifiers(bytes, i);
+        is_break = is_break || arc_mods.contains('b');
+        is_ex = is_ex || arc_mods.contains('x');
+        chain.push((arc.pattern, arc.end, arc.reflect, is_star));
+    }
+
+    let trail_mods = read_modifiers(bytes, i);
+    is_break = is_break || trail_mods.contains('b');
+    is_ex = is_ex || trail_mods.contains('x');
+
+    let mut shared_dur: Option<(Option<f32>, f32, Option<f32>)> = None;
+    if *i < bytes.len() && bytes[*i] == b'[' {
+        shared_dur = Some(parse_duration(bytes, i)?);
+    }
+    let (eq_bpm, base_dur, explicit_delay) = shared_dur.unwrap_or((None, 0.0, None));
+
+    let cur_bpm = current_bpm_at(chart, measure);
+    let (delay, dur) = if let Some(d) = explicit_delay {
+        // `##` format: X and Y are in seconds, convert to measures.
+        let mult = cur_bpm / 240.0;
+        (d * mult, base_dur * mult)
+    } else {
+        scale_with_eq_bpm(eq_bpm, base_dur, cur_bpm)
+    };
+
+    chart.notes.push(SimaiNote::Slide {
+        measure,
+        start: button,
+        end: first_arc.end,
+        pattern: first_arc.pattern,
+        reflect: first_arc.reflect,
+        duration: dur,
+        delay,
+        is_break,
+        is_ex,
+        is_tapless,
+        chain,
+    });
+
     Ok(())
 }
 
@@ -508,7 +610,7 @@ fn parse_touch_note(
     if is_hold {
         let mut duration = 0.0;
         if *i < bytes.len() && bytes[*i] == b'[' {
-            let (_eq, d) = parse_duration(bytes, i)?;
+            let (_eq, d, _) = parse_duration(bytes, i)?;
             duration = d;
         }
         chart.notes.push(SimaiNote::TouchHold { measure, region, position, duration, is_firework });
